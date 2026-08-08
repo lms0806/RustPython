@@ -227,11 +227,13 @@ pub struct FormatSpec {
     conversion: Option<FormatConversion>,
     fill: Option<CodePoint>,
     align: Option<FormatAlign>,
+    align_specified: bool,
     sign: Option<FormatSign>,
     alternate_form: bool,
     width: Option<usize>,
     grouping_option: Option<FormatGrouping>,
     precision: Option<usize>,
+    frac_grouping_option: Option<FormatGrouping>,
     format_type: Option<FormatType>,
 }
 
@@ -291,22 +293,49 @@ fn parse_zero(text: &Wtf8) -> (bool, &Wtf8) {
     }
 }
 
-fn parse_precision(text: &Wtf8) -> Result<(Option<usize>, &Wtf8), FormatSpecError> {
+fn parse_char(text: &Wtf8, expected: char) -> (bool, &Wtf8) {
     let mut chars = text.code_points();
-    Ok(match chars.next().and_then(CodePoint::to_char) {
-        Some('.') => {
-            let (size, remaining) = parse_number(chars.as_wtf8())?;
-            if let Some(size) = size {
-                if size > i32::MAX as usize {
-                    return Err(FormatSpecError::PrecisionTooBig);
-                }
-                (Some(size), remaining)
-            } else {
-                (None, text)
-            }
+    if chars.next().and_then(CodePoint::to_char) == Some(expected) {
+        (true, chars.as_wtf8())
+    } else {
+        (false, text)
+    }
+}
+
+fn parse_precision(
+    text: &Wtf8,
+) -> Result<(Option<usize>, Option<FormatGrouping>, &Wtf8), FormatSpecError> {
+    let (dot, text) = parse_char(text, '.');
+    if !dot {
+        return Ok((None, None, text));
+    }
+    let (precision, text) = parse_number(text)?;
+    if let Some(precision) = precision
+        && precision > i32::MAX as usize
+    {
+        return Err(FormatSpecError::PrecisionTooBig);
+    }
+    let mut frac_grouping = None;
+    let (comma, text) = parse_char(text, ',');
+    if comma {
+        frac_grouping = Some(FormatGrouping::Comma);
+    }
+    let (underscore, text) = parse_char(text, '_');
+    if underscore {
+        if frac_grouping.is_some() {
+            return Err(FormatSpecError::ExclusiveFormat(',', '_'));
         }
-        _ => (None, text),
-    })
+        frac_grouping = Some(FormatGrouping::Underscore);
+    }
+    let (trailing_comma, _) = parse_char(text, ',');
+    if trailing_comma && frac_grouping == Some(FormatGrouping::Underscore) {
+        return Err(FormatSpecError::ExclusiveFormat(',', '_'));
+    }
+    // Not having a precision or underscore/comma after a dot is an error.
+    if precision.is_none() && frac_grouping.is_none() {
+        return Err(FormatSpecError::PrecisionMissing);
+    }
+    Ok((precision, frac_grouping, text))
 }
 
 impl FormatSpec {
@@ -318,6 +347,7 @@ impl FormatSpec {
         // get_integer in CPython
         let (conversion, text) = FormatConversion::parse(text);
         let (mut fill, mut align, text) = parse_fill_and_align(text);
+        let align_specified = align.is_some();
         let (sign, text) = FormatSign::parse(text);
         let (alternate_form, text) = parse_alternate_form(text);
         let (zero, text) = parse_zero(text);
@@ -331,7 +361,7 @@ impl FormatSpec {
         if let Some(grouping) = grouping_option {
             Self::validate_separator(grouping, text)?;
         }
-        let (precision, text) = parse_precision(text)?;
+        let (precision, frac_grouping_option, text) = parse_precision(text)?;
         let (format_type, text) = FormatType::parse(text);
         if !text.is_empty() {
             return Err(FormatSpecError::InvalidFormatSpecifier);
@@ -346,11 +376,13 @@ impl FormatSpec {
             conversion,
             fill,
             align,
+            align_specified,
             sign,
             alternate_form,
             width,
             grouping_option,
             precision,
+            frac_grouping_option,
             format_type,
         })
     }
@@ -463,6 +495,21 @@ impl FormatSpec {
                 Err(FormatSpecError::UnspecifiedFormat('_', ch))
             }
             _ => Ok(()),
+        }?;
+        if let Some(grouping) = self.frac_grouping_option
+            && matches!(format_type, FormatType::Number(_))
+        {
+            let ch = char::from(format_type);
+            return Err(FormatSpecError::UnspecifiedFormat(char::from(grouping), ch));
+        }
+        Ok(())
+    }
+
+    fn validate_complex_padding_and_alignment(&self) -> Result<(), FormatSpecError> {
+        match &self.fill.unwrap_or_else(|| ' '.into()).to_char() {
+            Some('0') => Err(FormatSpecError::ZeroPadding),
+            _ if self.align == Some(FormatAlign::AfterSign) => Err(FormatSpecError::AlignmentFlag),
+            _ => Ok(()),
         }
     }
 
@@ -491,7 +538,9 @@ impl FormatSpec {
                 let disp_digit_cnt = if self.fill == Some('0'.into())
                     && self.align == Some(FormatAlign::AfterSign)
                 {
-                    let width = self.width.unwrap_or(magnitude_len) as i32 - prefix.len() as i32;
+                    let width = self.width.unwrap_or(magnitude_len) as i32
+                        - prefix.len() as i32
+                        - self.frac_separator_count(&magnitude_str) as i32;
                     cmp::max(width, magnitude_len as i32)
                 } else {
                     magnitude_len as i32
@@ -500,6 +549,41 @@ impl FormatSpec {
             }
             None => magnitude_str,
         }
+    }
+
+    fn frac_digit_span(&self, magnitude_str: &str) -> Option<(FormatGrouping, usize, usize)> {
+        let grouping = self.frac_grouping_option?;
+        let start = magnitude_str.find('.')? + 1;
+        let end = magnitude_str[start..]
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .map_or(magnitude_str.len(), |offset| start + offset);
+        (start < end).then_some((grouping, start, end))
+    }
+
+    fn frac_separator_count(&self, magnitude_str: &str) -> usize {
+        match self.frac_digit_span(magnitude_str) {
+            Some((_, start, end)) => (end - start - 1) / self.get_separator_interval(),
+            None => 0,
+        }
+    }
+
+    fn add_frac_separators(&self, magnitude_str: String) -> String {
+        let Some((grouping, start, end)) = self.frac_digit_span(&magnitude_str) else {
+            return magnitude_str;
+        };
+        let inter = self.get_separator_interval();
+        let sep = char::from(grouping);
+        let mut result = magnitude_str[..start].to_string();
+        let mut frac = &magnitude_str[start..end];
+        while frac.len() > inter {
+            result.push_str(&frac[..inter]);
+            result.push(sep);
+            frac = &frac[inter..];
+        }
+        result.push_str(frac);
+        result.push_str(&magnitude_str[end..]);
+        result
     }
 
     /// Returns true if this format spec uses the locale-aware 'n' format type.
@@ -664,6 +748,7 @@ impl FormatSpec {
         num: &Complex64,
         locale: &LocaleInfo,
     ) -> Result<String, FormatSpecError> {
+        self.validate_format(FormatType::FixedPoint(Case::Lower))?;
         // Reuse format_complex_re_im with 'g' type to get the base formatted parts,
         // then apply locale grouping. This matches CPython's format_complex_internal:
         // 'n' → 'g', add_parens=0, skip_re=0.
@@ -707,6 +792,7 @@ impl FormatSpec {
         // No parentheses for 'n' format (CPython: add_parens=0)
         let magnitude_str = format!("{grouped_re}{grouped_im}");
 
+        self.validate_complex_padding_and_alignment()?;
         Ok(self.format_sign_and_align(&AsciiStr::new(&magnitude_str), "", FormatAlign::Right))
     }
 
@@ -850,6 +936,7 @@ impl FormatSpec {
             }
         };
         let magnitude_str = self.add_magnitude_separators(raw_magnitude_str?, sign_str);
+        let magnitude_str = self.add_frac_separators(magnitude_str);
         Ok(
             self.format_sign_and_align(
                 &AsciiStr::new(&magnitude_str),
@@ -945,13 +1032,24 @@ impl FormatSpec {
         self.validate_format(FormatType::String)?;
         match self.format_type {
             Some(FormatType::String) | None => {
+                if self.align == Some(FormatAlign::AfterSign) && self.align_specified {
+                    return Err(FormatSpecError::StringAlignmentFlag);
+                }
                 // CPython parity: precision truncates BEFORE width pads.
                 // `'{:3.2s}'.format('abc')` -> 'ab ' (truncate to 'ab', pad to 3).
                 let truncated: String = match self.precision {
                     Some(p) => s.deref().chars().take(p).collect(),
                     None => s.deref().to_owned(),
                 };
-                Ok(self.format_sign_and_align(&truncated, "", FormatAlign::Left))
+                let spec = Self {
+                    align: if self.align == Some(FormatAlign::AfterSign) {
+                        Some(FormatAlign::Left)
+                    } else {
+                        self.align
+                    },
+                    ..*self
+                };
+                Ok(spec.format_sign_and_align(&truncated, "", FormatAlign::Left))
             }
             _ => {
                 let ch = char::from(self.format_type.as_ref().unwrap());
@@ -968,17 +1066,8 @@ impl FormatSpec {
         } else {
             format!("{formatted_re}{formatted_im}")
         };
-        if let Some(FormatAlign::AfterSign) = &self.align {
-            return Err(FormatSpecError::AlignmentFlag);
-        }
-        match &self.fill.unwrap_or_else(|| ' '.into()).to_char() {
-            Some('0') => Err(FormatSpecError::ZeroPadding),
-            _ => Ok(self.format_sign_and_align(
-                &AsciiStr::new(&magnitude_str),
-                "",
-                FormatAlign::Right,
-            )),
-        }
+        self.validate_complex_padding_and_alignment()?;
+        Ok(self.format_sign_and_align(&AsciiStr::new(&magnitude_str), "", FormatAlign::Right))
     }
 
     fn format_complex_re_im(&self, num: &Complex64) -> Result<(String, String), FormatSpecError> {
@@ -1074,17 +1163,16 @@ impl FormatSpec {
                 },
             },
         }?;
-        match &self.grouping_option {
+        let magnitude_str = match &self.grouping_option {
             Some(fg) => {
                 let sep = char::from(fg);
                 let inter = self.get_separator_interval().try_into().unwrap();
                 let len = magnitude_str.len() as i32;
-                let separated_magnitude =
-                    Self::add_magnitude_separators_for_char(magnitude_str, inter, sep, len);
-                Ok(separated_magnitude)
+                Self::add_magnitude_separators_for_char(magnitude_str, inter, sep, len)
             }
-            None => Ok(magnitude_str),
-        }
+            None => magnitude_str,
+        };
+        Ok(self.add_frac_separators(magnitude_str))
     }
 
     fn format_sign_and_align<T>(
@@ -1175,6 +1263,7 @@ impl Deref for AsciiStr<'_> {
 pub enum FormatSpecError {
     DecimalDigitsTooMany,
     PrecisionTooBig,
+    PrecisionMissing,
     InvalidFormatSpecifier,
     UnspecifiedFormat(char, char),
     ExclusiveFormat(char, char),
@@ -1185,6 +1274,7 @@ pub enum FormatSpecError {
     CodeNotInRange,
     ZeroPadding,
     AlignmentFlag,
+    StringAlignmentFlag,
     NotImplemented(char, &'static str),
 }
 
@@ -1290,8 +1380,7 @@ impl FieldName {
             FieldType::Index(index)
         } else if first
             .as_str()
-            .ok()
-            .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .is_ok_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
         {
             // All-digit segment whose value overflows usize itself.
             return Err(FormatParseError::TooManyDecimalDigits);
@@ -1534,11 +1623,13 @@ mod tests {
             conversion: None,
             fill: None,
             align: None,
+            align_specified: false,
             sign: None,
             alternate_form: false,
             width: Some(33),
             grouping_option: None,
             precision: None,
+            frac_grouping_option: None,
             format_type: None,
         });
         assert_eq!(FormatSpec::parse("33"), expected);
@@ -1550,11 +1641,13 @@ mod tests {
             conversion: None,
             fill: Some('<'.into()),
             align: Some(FormatAlign::Right),
+            align_specified: true,
             sign: None,
             alternate_form: false,
             width: Some(33),
             grouping_option: None,
             precision: None,
+            frac_grouping_option: None,
             format_type: None,
         });
         assert_eq!(FormatSpec::parse("<>33"), expected);
@@ -1566,11 +1659,13 @@ mod tests {
             conversion: None,
             fill: Some('<'.into()),
             align: Some(FormatAlign::Right),
+            align_specified: true,
             sign: Some(FormatSign::Minus),
             alternate_form: true,
             width: Some(23),
             grouping_option: Some(FormatGrouping::Comma),
             precision: Some(11),
+            frac_grouping_option: None,
             format_type: Some(FormatType::Binary),
         });
         assert_eq!(FormatSpec::parse("<>-#23,.11b"), expected);
@@ -1610,6 +1705,78 @@ mod tests {
         assert_eq!(format_bool("F", false), Ok("0.000000".to_owned()));
         assert_eq!(format_bool("%", true), Ok("100.000000%".to_owned()));
         assert_eq!(format_bool("%", false), Ok("0.000000%".to_owned()));
+    }
+
+    #[test]
+    fn format_string_zero_padding_uses_left_alignment() {
+        let spec = FormatSpec::parse("08s").unwrap();
+        let value = "result".to_owned();
+
+        assert_eq!(spec.format_string(&value), Ok("result00".to_owned()));
+    }
+
+    #[test]
+    fn format_string_explicit_after_sign_alignment_is_invalid() {
+        let spec = FormatSpec::parse("=8s").unwrap();
+        let value = "result".to_owned();
+
+        assert_eq!(
+            spec.format_string(&value),
+            Err(FormatSpecError::StringAlignmentFlag)
+        );
+    }
+
+    #[test]
+    fn format_complex_rejects_zero_padding_before_after_sign_alignment() {
+        for text in [
+            "08.1f", "=08.1f", "0=8.1f", "#08.1f", "0>8.1f", "0<8.1f", "0^8.1f",
+        ] {
+            let spec = FormatSpec::parse(text).unwrap();
+            assert_eq!(
+                spec.format_complex(&Complex64::new(1.0, 2.0)),
+                Err(FormatSpecError::ZeroPadding),
+                "{text}"
+            );
+        }
+
+        let spec = FormatSpec::parse("=8.1f").unwrap();
+        assert_eq!(
+            spec.format_complex(&Complex64::new(1.0, 2.0)),
+            Err(FormatSpecError::AlignmentFlag)
+        );
+    }
+
+    #[test]
+    fn format_int_zero_padding_stays_after_sign() {
+        let spec = FormatSpec::parse("08").unwrap();
+
+        assert_eq!(
+            spec.format_int(&BigInt::from(-42)),
+            Ok("-0000042".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_complex_locale_rejects_zero_padding_before_after_sign_alignment() {
+        let locale = LocaleInfo {
+            thousands_sep: String::new(),
+            decimal_point: ".".to_owned(),
+            grouping: vec![],
+        };
+        for text in ["08n", "=08n", "0=8n", "#08n", "0>8n", "0<8n", "0^8n"] {
+            let spec = FormatSpec::parse(text).unwrap();
+            assert_eq!(
+                spec.format_complex_locale(&Complex64::new(1.0, 2.0), &locale),
+                Err(FormatSpecError::ZeroPadding),
+                "{text}"
+            );
+        }
+
+        let spec = FormatSpec::parse("=8n").unwrap();
+        assert_eq!(
+            spec.format_complex_locale(&Complex64::new(1.0, 2.0), &locale),
+            Err(FormatSpecError::AlignmentFlag)
+        );
     }
 
     #[test]
@@ -1736,6 +1903,106 @@ mod tests {
         assert_eq!(fmt_float("06,", f64::INFINITY), "000inf");
         assert_eq!(fmt_float("06,", f64::NAN), "000nan");
         assert_eq!(fmt_float("06,%", f64::INFINITY), "00inf%");
+    }
+
+    #[test]
+    fn format_float_fractional_grouping() {
+        // Fraction digits group away from the decimal point, so the last group
+        // may be shorter than the interval.
+        assert_eq!(fmt_float(".6,f", 1234.56789), "1234.567,890");
+        assert_eq!(fmt_float(".7,f", 1234.56789), "1234.567,890,0");
+        assert_eq!(fmt_float(".4,f", 1.1), "1.100,0");
+        assert_eq!(fmt_float(".3,f", 1.1), "1.100");
+        assert_eq!(fmt_float(".6_f", 1234.56789), "1234.567_890");
+        // Omitting the precision keeps the type's default.
+        assert_eq!(fmt_float(".,f", 1.1), "1.100,000");
+        // The two parts are independent and may use different separators.
+        assert_eq!(fmt_float(",.6,f", 1234.56789), "1,234.567,890");
+        assert_eq!(fmt_float(",.6_f", 1234.56789), "1,234.567_890");
+        assert_eq!(fmt_float("_.6,f", 1234.56789), "1_234.567,890");
+    }
+
+    #[test]
+    fn format_float_fractional_grouping_never_touches_tail() {
+        // Only the digits between the point and any tail are groupable: the
+        // exponent and a trailing percent sign must stay intact.
+        assert_eq!(fmt_float(".6,e", 12345678900.0), "1.234,568e+10");
+        assert_eq!(fmt_float(".6,E", 1234.5678), "1.234,568E+03");
+        assert_eq!(fmt_float(".8,%", 1.2345e-05), "0.001,234,50%");
+        // Values with no point have nothing to group.
+        assert_eq!(fmt_float(".6,f", f64::INFINITY), "inf");
+        assert_eq!(fmt_float(".6,f", f64::NAN), "nan");
+        assert_eq!(fmt_float(".0,f", 1234.56789), "1235");
+    }
+
+    #[test]
+    fn format_float_fractional_grouping_counts_toward_width() {
+        // Separators are inserted before padding, so they consume width.
+        assert_eq!(fmt_float("020.6,f", 1234.56789), "000000001234.567,890");
+        assert_eq!(fmt_float("015.6,f", 1.5), "0000001.500,000");
+        assert_eq!(fmt_float("<20.6,f", 1234.56789), "1234.567,890        ");
+        // Zero padding of the integer part must reserve room for them too.
+        assert_eq!(fmt_float("020,.6,f", 1234.56789), "0,000,001,234.567,890");
+        assert_eq!(fmt_float("+020,.6_f", 1e-10), "+000,000,000.000_000");
+        assert_eq!(fmt_float("= 015,.6,E", 1234.0), " 01.234,000E+03");
+        assert_eq!(fmt_float("-015_._e", 1.1), "001.100_000e+00");
+    }
+
+    #[test]
+    fn format_parse_fractional_grouping_errors() {
+        // Mixing the two separators is rejected wherever it appears.
+        assert_eq!(
+            FormatSpec::parse(".,_f"),
+            Err(FormatSpecError::ExclusiveFormat(',', '_'))
+        );
+        assert_eq!(
+            FormatSpec::parse("._,f"),
+            Err(FormatSpecError::ExclusiveFormat(',', '_'))
+        );
+        // A repeated separator is left in the spec and rejected as a whole.
+        assert_eq!(
+            FormatSpec::parse(".,,f"),
+            Err(FormatSpecError::InvalidFormatSpecifier)
+        );
+        assert_eq!(
+            FormatSpec::parse(".__f"),
+            Err(FormatSpecError::InvalidFormatSpecifier)
+        );
+        // A dot needs either digits or a separator after it.
+        assert_eq!(
+            FormatSpec::parse("."),
+            Err(FormatSpecError::PrecisionMissing)
+        );
+        assert_eq!(
+            FormatSpec::parse(".f"),
+            Err(FormatSpecError::PrecisionMissing)
+        );
+        // 'n' draws its separators from the locale.
+        assert_eq!(
+            FormatSpec::parse(".6,n").unwrap().format_float(1234.5678),
+            Err(FormatSpecError::UnspecifiedFormat(',', 'n'))
+        );
+        assert_eq!(
+            FormatSpec::parse("._n").unwrap().format_float(1234.5678),
+            Err(FormatSpecError::UnspecifiedFormat('_', 'n'))
+        );
+        // The integer separator is reported first when both are present.
+        assert_eq!(
+            FormatSpec::parse("_.6,n").unwrap().format_float(1234.5678),
+            Err(FormatSpecError::UnspecifiedFormat('_', 'n'))
+        );
+        // The complex locale path rewrites 'n' to 'g', so it must validate first.
+        let locale = LocaleInfo {
+            thousands_sep: ",".to_owned(),
+            decimal_point: ".".to_owned(),
+            grouping: vec![3, 0],
+        };
+        assert_eq!(
+            FormatSpec::parse(".6,n")
+                .unwrap()
+                .format_complex_locale(&Complex64::new(1.0, 2.345678), &locale),
+            Err(FormatSpecError::UnspecifiedFormat(',', 'n'))
+        );
     }
 
     #[test]

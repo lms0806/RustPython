@@ -1378,23 +1378,11 @@ mod _socket {
         fn del(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<()> {
             // Emit ResourceWarning if socket is still open
             if zelf.sock.read().is_some() {
-                let laddr = if let Ok(sock) = zelf.sock()
-                    && let Ok(addr) = sock.local_addr()
-                    && let Ok(repr) = get_addr_tuple(&addr, vm).repr(vm)
-                {
-                    format!(", laddr={}", repr.as_wtf8())
-                } else {
-                    String::new()
-                };
-
-                let msg = format!(
-                    "unclosed <socket.socket fd={}, family={}, type={}, proto={}{}>",
-                    zelf.fileno(),
-                    zelf.family.load(),
-                    zelf.kind.load(),
-                    zelf.proto.load(),
-                    laddr
-                );
+                let repr = zelf
+                    .as_object()
+                    .repr(vm)
+                    .unwrap_or_else(|_| vm.ctx.new_str("<socket>"));
+                let msg = format!("unclosed {}", repr.as_wtf8());
                 let _ = crate::vm::warn::warn(
                     vm.ctx.new_str(msg).into(),
                     Some(vm.ctx.exceptions.resource_warning.to_owned()),
@@ -2325,8 +2313,8 @@ mod _socket {
 
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "android"))))]
     #[pyfunction]
-    fn sethostname(hostname: PyUtf8StrRef) -> std::io::Result<()> {
-        host_socket::sethostname(hostname.as_str())
+    fn sethostname(hostname: FsPath) -> std::io::Result<()> {
+        host_socket::sethostname(hostname.as_bytes())
     }
 
     #[pyfunction]
@@ -2612,8 +2600,15 @@ mod _socket {
             }
             Some(ArgStrOrBytesLike::Buf(b)) => {
                 let bytes = b.borrow_buf();
-                let host_str = core::str::from_utf8(&bytes)
-                    .map_err(|_| vm.new_unicode_decode_error("host bytes is not utf8"))?;
+                let host_str = core::str::from_utf8(&bytes).map_err(|e| {
+                    vm.new_unicode_decode_error_real(
+                        vm.ctx.new_str("utf-8"),
+                        vm.ctx.new_bytes(bytes.to_vec()),
+                        e.valid_up_to(),
+                        e.error_len().map_or(bytes.len(), |n| e.valid_up_to() + n),
+                        vm.ctx.new_str("host bytes is not utf8"),
+                    )
+                })?;
                 Some(host_str.to_owned())
             }
             None => None,
@@ -2627,14 +2622,35 @@ mod _socket {
                     ArgStrOrBytesLike::Str(s) => {
                         // For str, check for surrogates and raise UnicodeEncodeError if found
                         s.to_str()
-                            .ok_or_else(|| vm.new_unicode_encode_error("surrogates not allowed"))?
+                            .ok_or_else(|| {
+                                let start = s
+                                    .as_wtf8()
+                                    .code_points()
+                                    .position(|c| c.to_char().is_none())
+                                    .unwrap();
+                                vm.new_unicode_encode_error_real(
+                                    vm.ctx.new_str("utf-8"),
+                                    (*s).clone(),
+                                    start,
+                                    start + 1,
+                                    vm.ctx.new_str("surrogates not allowed"),
+                                )
+                            })?
                             .to_owned()
                     }
                     ArgStrOrBytesLike::Buf(b) => {
                         // For bytes, check if it's valid UTF-8
                         let bytes = b.borrow_buf();
                         core::str::from_utf8(&bytes)
-                            .map_err(|_| vm.new_unicode_decode_error("port is not utf8"))?
+                            .map_err(|e| {
+                                vm.new_unicode_decode_error_real(
+                                    vm.ctx.new_str("utf-8"),
+                                    vm.ctx.new_bytes(bytes.to_vec()),
+                                    e.valid_up_to(),
+                                    e.error_len().map_or(bytes.len(), |n| e.valid_up_to() + n),
+                                    vm.ctx.new_str("port is not utf8"),
+                                )
+                            })?
                             .to_owned()
                     }
                 };

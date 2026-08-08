@@ -24,9 +24,10 @@ pub(crate) mod _thread {
             PyBaseExceptionRef, PyDictRef, PyIntRef, PyStr, PyTupleRef, PyType, PyTypeRef,
             PyUtf8StrRef,
         },
-        common::wtf8::Wtf8Buf,
-        frame::FrameRef,
+        common::{lock::PyMutex, wtf8::Wtf8Buf},
+        frame::FrameObjectRef,
         function::{ArgCallable, FuncArgs, KwArgs, OptionalArg, PySetterValue, TimeoutSeconds},
+        object::{Traverse, TraverseFn},
         types::{Constructor, GetAttr, Representable, SetAttr},
     };
 
@@ -619,11 +620,10 @@ pub(crate) mod _thread {
     /// Clean up thread-local data for the current thread.
     /// This triggers __del__ on objects stored in thread-local variables.
     fn cleanup_thread_local_data() {
-        // Take all guards - this will trigger LocalGuard::drop for each,
-        // which removes the thread's dict from each Local instance
-        LOCAL_GUARDS.with(|guards| {
-            guards.borrow_mut().clear();
-        });
+        // Move all guards out before dropping them. A local dict's __del__ may
+        // re-enter thread-local access and borrow LOCAL_GUARDS again.
+        let guards = LOCAL_GUARDS.take();
+        drop(guards);
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "host_env"))]
@@ -929,15 +929,36 @@ pub(crate) mod _thread {
             if let Some(local_data) = self.local.upgrade() {
                 // Remove from map while holding the lock, but drop the value
                 // outside the lock to prevent deadlock if __del__ accesses _local
-                let removed = local_data.data.lock().remove(&self.thread_id);
+                let removed = local_data.state.lock().dicts.remove(&self.thread_id);
                 drop(removed);
             }
         }
     }
 
+    struct LocalState {
+        init_args: FuncArgs,
+        dicts: std::collections::HashMap<u64, PyDictRef>,
+    }
+
+    unsafe impl Traverse for LocalState {
+        fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+            self.init_args.traverse(tracer_fn);
+            #[allow(clippy::iter_over_hash_type)]
+            for dict in self.dicts.values() {
+                dict.traverse(tracer_fn);
+            }
+        }
+
+        fn clear(&mut self, out: &mut Vec<crate::PyObjectRef>) {
+            out.append(&mut self.init_args.args);
+            out.extend(self.init_args.kwargs.drain(..).map(|(_, value)| value));
+            out.extend(self.dicts.drain().map(|(_, dict)| dict.into()));
+        }
+    }
+
     // Shared data structure for Local
     struct LocalData {
-        data: parking_lot::Mutex<std::collections::HashMap<u64, PyDictRef>>,
+        state: PyMutex<LocalState>,
     }
 
     impl fmt::Debug for LocalData {
@@ -947,37 +968,62 @@ pub(crate) mod _thread {
     }
 
     #[pyattr]
-    #[pyclass(module = "_thread", name = "_local")]
+    #[pyclass(module = "_thread", name = "_local", traverse = "manual")]
     #[derive(Debug, PyPayload)]
     struct Local {
         inner: Arc<LocalData>,
     }
 
+    unsafe impl Traverse for Local {
+        fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+            self.inner.state.traverse(tracer_fn);
+        }
+
+        fn clear(&mut self, out: &mut Vec<crate::PyObjectRef>) {
+            if let Some(mut state) = self.inner.state.try_lock() {
+                state.clear(out);
+            }
+        }
+    }
+
     #[pyclass(with(GetAttr, SetAttr), flags(BASETYPE))]
     impl Local {
-        fn l_dict(&self, vm: &VirtualMachine) -> PyDictRef {
+        fn custom_init(cls: &Py<PyType>, vm: &VirtualMachine) -> Option<crate::types::InitFunc> {
+            let cls_init = cls.slots.init.load()?;
+            let object_init = vm
+                .ctx
+                .types
+                .object_type
+                .slots
+                .init
+                .load()
+                .map(|init| crate::types::fn_addr(init));
+            (Some(crate::types::fn_addr(cls_init)) != object_init).then_some(cls_init)
+        }
+
+        fn create_dict(&self, vm: &VirtualMachine) -> (PyDictRef, bool) {
             let thread_id = current_thread_id();
 
             // Fast path: check if dict exists under lock
-            let value = self.inner.data.lock().get(&thread_id).cloned();
+            let value = self.inner.state.lock().dicts.get(&thread_id).cloned();
             if let Some(dict) = value {
-                return dict;
+                return (dict, false);
             }
 
             // Slow path: allocate dict outside lock to reduce lock hold time
             let new_dict = vm.ctx.new_dict();
 
             // Insert with double-check to handle races
-            let mut data = self.inner.data.lock();
+            let mut state = self.inner.state.lock();
             use std::collections::hash_map::Entry;
-            let (dict, need_guard) = match data.entry(thread_id) {
+            let (dict, need_guard) = match state.dicts.entry(thread_id) {
                 Entry::Occupied(e) => (e.get().clone(), false),
                 Entry::Vacant(e) => {
                     e.insert(new_dict.clone());
                     (new_dict, true)
                 }
             };
-            drop(data); // Release lock before TLS access
+            drop(state); // Release lock before TLS access
 
             // Register cleanup guard only if we inserted a new entry
             if need_guard {
@@ -990,29 +1036,80 @@ pub(crate) mod _thread {
                 });
             }
 
-            dict
+            (dict, need_guard)
+        }
+
+        fn remove_current_dict(&self) {
+            let thread_id = current_thread_id();
+            let guard = LOCAL_GUARDS.with(|guards| {
+                let mut guards = guards.borrow_mut();
+                guards
+                    .iter()
+                    .rposition(|guard| {
+                        guard.thread_id == thread_id
+                            && guard.local.as_ptr() == Arc::as_ptr(&self.inner)
+                    })
+                    .map(|position| guards.remove(position))
+            });
+
+            if let Some(guard) = guard {
+                drop(guard);
+            } else {
+                let removed = self.inner.state.lock().dicts.remove(&thread_id);
+                drop(removed);
+            }
+        }
+
+        fn l_dict(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyDictRef> {
+            let (dict, created) = zelf.create_dict(vm);
+            if !created {
+                return Ok(dict);
+            }
+
+            let Some(init) = Self::custom_init(zelf.class(), vm) else {
+                return Ok(dict);
+            };
+            let init_args = zelf.inner.state.lock().init_args.clone();
+            if let Err(err) = init(zelf.as_object().to_owned(), init_args, vm) {
+                zelf.remove_current_dict();
+                return Err(err);
+            }
+
+            Ok(dict)
         }
 
         #[pygetset(name = "__dict__")]
-        fn dict(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyDictRef {
-            zelf.l_dict(vm)
+        fn dict(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyDictRef> {
+            Self::l_dict(&zelf, vm)
         }
 
         #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self {
+        fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            if !args.is_empty() && Self::custom_init(&cls, vm).is_none() {
+                return Err(vm.new_type_error("Initialization arguments are not supported"));
+            }
+
+            let zelf = Self {
                 inner: Arc::new(LocalData {
-                    data: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                    state: PyMutex::new(LocalState {
+                        init_args: args,
+                        dicts: std::collections::HashMap::new(),
+                    }),
                 }),
             }
-            .into_ref_with_type(vm, cls)
-            .map(Into::into)
+            .into_ref_with_type(vm, cls)?;
+
+            // type.__call__ invokes __init__ after __new__. Create this thread's
+            // dict first so assignments made by __init__ cannot recursively
+            // initialize the same local object.
+            zelf.create_dict(vm);
+            Ok(zelf.into())
         }
     }
 
     impl GetAttr for Local {
         fn getattro(zelf: &Py<Self>, attr: &Py<PyStr>, vm: &VirtualMachine) -> PyResult {
-            let l_dict = zelf.l_dict(vm);
+            let l_dict = Self::l_dict(zelf, vm)?;
             if attr.as_bytes() == b"__dict__" {
                 Ok(l_dict.into())
             } else {
@@ -1042,7 +1139,7 @@ pub(crate) mod _thread {
                     zelf.class().name()
                 )))
             } else {
-                let dict = zelf.l_dict(vm);
+                let dict = Self::l_dict(zelf, vm)?;
                 if let PySetterValue::Assign(value) = value {
                     dict.set_item(attr, value, vm)?;
                 } else {
@@ -1064,44 +1161,117 @@ pub(crate) mod _thread {
     pub(crate) use crate::vm::thread::CurrentFrameSlot;
 
     /// Get all threads' current (top) frames. Used by sys._current_frames().
-    pub(crate) fn get_all_current_frames(vm: &VirtualMachine) -> Vec<(u64, FrameRef)> {
+    pub(crate) fn get_all_current_frames(vm: &VirtualMachine) -> Vec<(u64, FrameObjectRef)> {
         // unix: read each thread's published top frame under stop-the-world so
         // the owning thread is parked at a safepoint and cannot pop or free the
         // frame while we take a strong reference. Request stop-the-world before
         // the registry lock to avoid deadlocking a thread parking mid-registry.
+        //
+        // For the current thread, use TLS CURRENT_FRAME directly because
+        // stack-allocated frames only update TLS (not top_frame).
         #[cfg(unix)]
         {
             use core::sync::atomic::Ordering;
+            let current_ident = get_ident();
             vm.state.stop_the_world.stop_the_world(vm);
             scopeguard::defer! { vm.state.stop_the_world.start_the_world(vm); }
             let registry = vm.state.thread_frames.lock();
             registry
                 .iter()
                 .filter_map(|(id, slot)| {
-                    let top = slot.top_frame.load(Ordering::Relaxed);
-                    core::ptr::NonNull::new(top).map(|p| {
-                        // SAFETY: world stopped -> the owning thread is parked
-                        // and cannot pop or free this frame; it is alive on
-                        // that thread's call stack.
-                        let py =
-                            unsafe { &*Py::<crate::frame::Frame>::from_payload_ptr(p.as_ptr()) };
-                        (*id, py.to_owned())
-                    })
+                    if *id == current_ident {
+                        // Current thread: materialize from TLS chain
+                        crate::frame::current_thread_frame_materialize(vm).map(|frame| (*id, frame))
+                    } else {
+                        // Other threads: try top_frame first (FrameObject),
+                        // fall back to top_iframe (may be a stack-allocated frame).
+                        let top = slot.top_frame.load(Ordering::Relaxed);
+                        if let Some(p) = core::ptr::NonNull::new(top) {
+                            let py = unsafe {
+                                &*Py::<crate::frame::FrameObject>::from_payload_ptr(p.as_ptr())
+                            };
+                            Some((*id, py.to_owned()))
+                        } else {
+                            // Stack-allocated frame: materialize from top_iframe.
+                            // SAFETY: world stopped -> owning thread is parked.
+                            let iframe_ptr = slot.top_iframe.load(Ordering::Relaxed)
+                                as *const crate::frame::InterpreterFrame;
+                            if !iframe_ptr.is_null() {
+                                // Materialize the entire frame chain and link
+                                // retained_back so f_back works after STW ends.
+                                let mut cur = iframe_ptr;
+                                let mut child_fo: Option<crate::PyRef<crate::frame::FrameObject>> =
+                                    None;
+                                while !cur.is_null() {
+                                    let iframe = unsafe { &*cur };
+                                    let fo = iframe.materialize(vm).to_owned();
+                                    if let Some(child) = child_fo.take() {
+                                        let mut guard = child.iframe().cold().retained_back.lock();
+                                        if guard.is_none() {
+                                            *guard = Some(fo.clone());
+                                        }
+                                    }
+                                    child_fo = Some(fo);
+                                    cur = iframe.previous();
+                                }
+                                let iframe = unsafe { &*iframe_ptr };
+                                let fo = iframe.materialize(vm);
+                                Some((*id, fo.to_owned()))
+                            } else {
+                                None
+                            }
+                        }
+                    }
                 })
                 .collect()
         }
         #[cfg(not(unix))]
         {
+            use core::sync::atomic::Ordering;
+            let current_ident = get_ident();
+            vm.state.stop_the_world.stop_the_world(vm);
+            scopeguard::defer! { vm.state.stop_the_world.start_the_world(vm); }
             let registry = vm.state.thread_frames.lock();
             registry
                 .iter()
                 .filter_map(|(id, slot)| {
-                    let frames = slot.frames.lock();
-                    // SAFETY: the owning thread can't pop while we hold the Mutex,
-                    // so the FramePtr is valid for the duration of the lock.
-                    frames
-                        .last()
-                        .map(|fp| (*id, unsafe { fp.as_ref() }.to_owned()))
+                    if *id == current_ident {
+                        // Current thread: materialize from TLS chain
+                        crate::frame::current_thread_frame_materialize(vm).map(|frame| (*id, frame))
+                    } else {
+                        // Other threads: use top_iframe to include
+                        // stack-allocated frames. Materialize the entire
+                        // chain and link retained_back so f_back works.
+                        // SAFETY: world stopped -> owning thread is parked.
+                        let iframe_ptr = slot.top_iframe.load(Ordering::Relaxed)
+                            as *const crate::frame::InterpreterFrame;
+                        if !iframe_ptr.is_null() {
+                            let mut cur = iframe_ptr;
+                            let mut child_fo: Option<crate::PyRef<crate::frame::FrameObject>> =
+                                None;
+                            while !cur.is_null() {
+                                let iframe = unsafe { &*cur };
+                                let fo = iframe.materialize(vm).to_owned();
+                                if let Some(child) = child_fo.take() {
+                                    let mut guard = child.iframe().cold().retained_back.lock();
+                                    if guard.is_none() {
+                                        *guard = Some(fo.clone());
+                                    }
+                                }
+                                child_fo = Some(fo);
+                                cur = iframe.previous();
+                            }
+                            let iframe = unsafe { &*iframe_ptr };
+                            let fo = iframe.materialize(vm);
+                            Some((*id, fo.to_owned()))
+                        } else {
+                            // Fall back to frames stack for FrameObject-only path
+                            let frames = slot.frames.lock();
+                            frames
+                                .last()
+                                .map(|fp| (*id, unsafe { fp.as_ref() }.to_owned()))
+                        }
+                    }
                 })
                 .collect()
         }
